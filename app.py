@@ -24,6 +24,8 @@ class DigitalTwin:
     def __init__(self):
         self.simulation_data = []
         self.is_running = False
+        self.soh = 98.5
+        self.base_wear_rate = 1.5e-7
         
     def predict_temperature(self, ambient_temp, current, velocity, season):
         """Combined prediction using both RF and XGBoost"""
@@ -62,6 +64,40 @@ class DigitalTwin:
             return round(max(0, min(100, ensemble_pred)), 1)
         except:
             return 70.0  # Fallback
+            
+    def calculate_soh_deg(self, current, battery_temp, soc, dt_seconds=1, accel_factor=1):
+        """
+        Calculate and update the State of Health degradation.
+        Returns the updated SOH and an instantaneous 'Stress Index' (0-100).
+        """
+        # Current Stress (exponential factor based on high current)
+        f_current = 1.0 + 0.005 * (current ** 2)
+        
+        # Thermal Stress (Arrhenius degradation above 25C, cold plating below 15C)
+        if battery_temp >= 25:
+            f_temp = np.exp(0.07 * (battery_temp - 25))
+        elif battery_temp < 15:
+            f_temp = 1.0 + 0.05 * (15 - battery_temp)
+        else:
+            f_temp = 1.0
+            
+        # SoC Stress (Extreme high or extreme low SoC accelerates capacity fade)
+        f_soc = 1.0 + 2.0 * (((soc - 50) / 50) ** 4)
+        
+        # Total Stress multiplier
+        stress_multiplier = f_current * f_temp * f_soc
+        
+        # Calculate wear for this interval (base_wear_rate is per second)
+        wear = self.base_wear_rate * stress_multiplier * dt_seconds * accel_factor
+        
+        # Decrement SOH
+        self.soh = max(0.0, self.soh - wear)
+        
+        # Calculate an instantaneous stress index (scaled 0 to 100 for display)
+        # 1.0 multiplier maps to ~0 stress, higher multipliers scale up to 100.
+        stress_index = min(100.0, round((stress_multiplier - 1.0) * 1.5, 1))
+        
+        return round(self.soh, 4), stress_index
     
     def generate_simulation_data(self, scenario="normal"):
         """Generate realistic simulation data"""
@@ -100,9 +136,16 @@ def predict_manual():
     velocity = float(data.get('velocity', 50))
     season = int(data.get('season', 1))
     
+    starting_soh = data.get('starting_soh')
+    if starting_soh is not None:
+        twin.soh = float(starting_soh)
+    
     # Make predictions
     battery_temp = twin.predict_temperature(ambient_temp, current, velocity, season)
     soc = twin.predict_soc(current, velocity, ambient_temp, 0.5, season)
+    
+    # SOH estimation (simulate a step)
+    soh, stress_index = twin.calculate_soh_deg(current, battery_temp, soc, dt_seconds=1, accel_factor=1)
     
     # Calculate additional metrics
     power_kw = round((current * 370) / 1000, 2)
@@ -111,6 +154,8 @@ def predict_manual():
     return jsonify({
         "battery_temp": battery_temp,
         "soc": soc,
+        "soh": soh,
+        "stress_index": stress_index,
         "power_kw": power_kw,
         "efficiency": efficiency,
         "status": "success"
@@ -121,11 +166,13 @@ def start_simulation():
     """Start real-time simulation"""
     data = request.json
     scenario = data.get('scenario', 'normal')
+    starting_soh = data.get('starting_soh', 98.5)
     
     twin.is_running = True
     twin.simulation_data = []
+    twin.soh = float(starting_soh)
     
-    return jsonify({"status": "simulation_started", "scenario": scenario})
+    return jsonify({"status": "simulation_started", "scenario": scenario, "starting_soh": twin.soh})
 
 @app.route('/stop_simulation', methods=['POST'])
 def stop_simulation():
@@ -141,6 +188,7 @@ def get_simulation_data():
     
     # Generate new data point
     scenario = request.args.get('scenario', 'normal')
+    accel_factor = float(request.args.get('accel_factor', 1))
     sim_data = twin.generate_simulation_data(scenario)
     
     # Make predictions
@@ -153,6 +201,11 @@ def get_simulation_data():
         sim_data['ambient_temp'], 0.1, sim_data['season']
     )
     
+    # Calculate SOH and stress index
+    soh, stress_index = twin.calculate_soh_deg(
+        sim_data['current'], battery_temp, soc, dt_seconds=1, accel_factor=accel_factor
+    )
+    
     # Calculate metrics
     power_kw = round((sim_data['current'] * 370) / 1000, 2)
     efficiency = round(max(70, 100 - abs(sim_data['current']) * 0.1), 1)
@@ -161,6 +214,8 @@ def get_simulation_data():
         **sim_data,
         "battery_temp": battery_temp,
         "soc": soc,
+        "soh": soh,
+        "stress_index": stress_index,
         "power_kw": power_kw,
         "efficiency": efficiency,
         "status": "running"
